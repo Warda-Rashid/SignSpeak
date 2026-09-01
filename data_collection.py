@@ -118,6 +118,7 @@ def main():
     )
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
         num_hands=1,
         min_hand_detection_confidence=0.7,
         min_hand_presence_confidence=0.5,
