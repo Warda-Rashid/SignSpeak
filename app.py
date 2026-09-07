@@ -522,6 +522,10 @@ def process_camera_frame(img, state, landmarker, model, scaler, label_encoder):
         return img
 
     hand_detected = len(results.hand_landmarks) > 0
+    n_hands = len(results.hand_landmarks)
+
+    # Always draw detection debug info on the frame
+    _draw_overlay(img, f"Hands detected: {n_hands}", (200, 200, 200), y=65, scale=0.6, thickness=1)
 
     if hand_detected:
         for hl in results.hand_landmarks:
@@ -953,6 +957,32 @@ def main():
                                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                 st.image(frame_rgb, use_container_width=True)
                                 st.session_state.camera_active = True
+
+                                # Show live detection status
+                                with state.lock:
+                                    det_label = state.current_label
+                                    det_conf = state.current_confidence
+                                    det_status = state.current_status
+                                if det_status == "sign_detected" and det_label:
+                                    st.success(
+                                        f"**Recognized: {det_label.upper()}** "
+                                        f"({det_conf:.0%} confidence)"
+                                    )
+                                elif det_status == "recognizing" and det_label:
+                                    st.info(
+                                        f"Recognizing... {det_label} ({det_conf:.0%}) — "
+                                        f"hold steady for stability confirmation"
+                                    )
+                                elif det_status == "low_confidence":
+                                    st.warning(
+                                        f"Low confidence: {det_conf:.0%} — "
+                                        f"move closer or improve lighting"
+                                    )
+                                elif det_status == "no_hand":
+                                    st.warning(
+                                        "No hand detected — make sure your hand is "
+                                        "clearly visible and well-lit"
+                                    )
                             else:
                                 st.warning("Frame processing failed. Please try again.")
                 except Exception as e:
@@ -1056,6 +1086,14 @@ def main():
 
                         if results is not None:
                             hand_detected = len(results.hand_landmarks) > 0
+                            n_hands = len(results.hand_landmarks)
+
+                            # Always draw detection debug info
+                            _draw_overlay(
+                                frame, f"Hands detected: {n_hands}",
+                                (200, 200, 200), y=65, scale=0.6, thickness=1
+                            )
+
                             if hand_detected:
                                 _draw_hand_skeleton(frame, results.hand_landmarks[0])
                                 hand_lms = results.hand_landmarks[0]
@@ -1070,8 +1108,16 @@ def main():
                                 enc_class = model.classes_[idx]
                                 label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
 
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                st.image(frame_rgb, use_container_width=True)
+
+                                # Clear result feedback
                                 if conf >= state.threshold:
                                     _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
+                                    st.success(
+                                        f"**Recognized sign: {label.upper()}** "
+                                        f"with {conf:.0%} confidence"
+                                    )
                                     with state.lock:
                                         if not state.history or state.history[-1]["label"] != label:
                                             state.history.append({
@@ -1079,13 +1125,32 @@ def main():
                                                 "confidence": conf,
                                                 "time": datetime.now().strftime("%H:%M:%S"),
                                             })
+                                            st.success(
+                                                f"Saved to history: **{label.upper()}** "
+                                                f"({conf:.0%})"
+                                            )
+                                        else:
+                                            st.info(
+                                                f"Already in history: **{label.upper()}** — "
+                                                f"show a different sign or wait "
+                                                f"{ABSENCE_COOLDOWN:.0f}s to re-record"
+                                            )
                                 else:
-                                    _draw_overlay(frame, f"Low conf: {conf:.0%}", (100, 180, 255))
+                                    st.warning(
+                                        f"Prediction: **{label}** but only "
+                                        f"{conf:.0%} confidence (threshold: "
+                                        f"{state.threshold:.0%}). "
+                                        f"Hold your sign steadier or improve lighting."
+                                    )
                             else:
                                 _draw_overlay(frame, "No hand detected", (180, 180, 180))
-
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            st.image(frame_rgb, use_container_width=True)
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                st.image(frame_rgb, use_container_width=True)
+                                st.warning(
+                                    "No hand detected — make sure your hand is "
+                                    "clearly visible in the frame and well-lit. "
+                                    "Try holding it closer to the camera."
+                                )
                     else:
                         st.warning(
                             f"Captured image could not be decoded properly "
