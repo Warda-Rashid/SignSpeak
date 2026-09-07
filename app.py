@@ -385,9 +385,9 @@ def load_hand_landmarker():
         base_options=base_options,
         running_mode=mp_vision.RunningMode.VIDEO,
         num_hands=1,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
     )
     return mp_vision.HandLandmarker.create_from_options(options)
 
@@ -437,14 +437,29 @@ def _draw_stability_bar(frame, progress, y_offset=0):
 
 
 def _draw_hand_skeleton(frame, hand_landmarks):
-    """Draw hand skeleton overlay."""
+    """Draw hand skeleton overlay with visible joints and connections."""
     h, w, _ = frame.shape
     points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+
+    # Draw connections (thicker for visibility)
     for s, e in HAND_CONNECTIONS:
-        cv2.line(frame, points[s], points[e], (0, 200, 120), 2, cv2.LINE_AA)
-    for p in points:
-        cv2.circle(frame, p, 5, (0, 255, 0), -1)
-        cv2.circle(frame, p, 5, (255, 255, 255), 1)
+        cv2.line(frame, points[s], points[e], (0, 200, 120), 3, cv2.LINE_AA)
+
+    # Draw joint circles — larger for visibility
+    TIP_IDS = {4, 8, 12, 16, 20}  # fingertip landmark indices
+    for i, p in enumerate(points):
+        if i == 0:
+            # Wrist — larger, different color
+            cv2.circle(frame, p, 8, (255, 100, 0), -1)
+            cv2.circle(frame, p, 8, (255, 255, 255), 2)
+        elif i in TIP_IDS:
+            # Fingertips — highlighted
+            cv2.circle(frame, p, 7, (0, 255, 255), -1)
+            cv2.circle(frame, p, 7, (255, 255, 255), 2)
+        else:
+            # Regular joints
+            cv2.circle(frame, p, 5, (0, 255, 0), -1)
+            cv2.circle(frame, p, 5, (255, 255, 255), 1)
 
 
 # ─────────────────────────────────────────────────────────
@@ -507,6 +522,12 @@ def process_camera_frame(img, state, landmarker, model, scaler, label_encoder):
     # Ensure contiguous uint8 array for MediaPipe
     rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+    # Debug: log image properties to app logs (visible in Streamlit Cloud)
+    print(
+        f"[SignSpeak] mp.Image: {mp_image.width}x{mp_image.height}, "
+        f"dtype={rgb.dtype}, shape={rgb.shape}"
+    )
 
     # Monotonic timestamp (ms) for VIDEO mode tracking
     with state.lock:
@@ -820,7 +841,11 @@ def render_prediction_panel(state):
         """, unsafe_allow_html=True)
 
 
-def render_history_list(history):
+def render_history_list(state):
+    """Render recognition history with delete buttons per entry."""
+    with state.lock:
+        history = list(state.history)
+
     if not history:
         st.markdown("""
         <div style="color:rgba(255,255,255,0.4); font-size:0.85rem; text-align:center; padding:1rem 0;">
@@ -831,22 +856,51 @@ def render_history_list(history):
 
     st.markdown("""
     <div class="history-header">
-        <span style="width:25%">Time</span>
-        <span style="width:50%">Sign</span>
-        <span style="width:25%; text-align:right">Confidence</span>
+        <span style="width:20%">Time</span>
+        <span style="width:35%">Sign</span>
+        <span style="width:20%; text-align:right">Conf</span>
+        <span style="width:25%; text-align:right"></span>
     </div>
     """, unsafe_allow_html=True)
 
-    rows = ""
-    for entry in reversed(history[-25:]):
-        rows += f"""
-        <div class="history-row">
-            <span class="time">{entry['time']}</span>
-            <span class="sign">{entry['label'].upper()}</span>
-            <span class="conf">{entry['confidence']:.0%}</span>
-        </div>
-        """
-    st.markdown(rows, unsafe_allow_html=True)
+    # Track which indices to delete this rerun
+    if "_history_deletes" not in st.session_state:
+        st.session_state._history_deletes = []
+
+    # Show most recent 25 entries
+    displayed = list(enumerate(history))[-25:]
+    for idx, entry in reversed(displayed):
+        col_t, col_s, col_c, col_d = st.columns([2, 3.5, 2, 2.5])
+        with col_t:
+            st.markdown(
+                f'<span style="color:rgba(255,255,255,0.5);font-size:0.82rem">'
+                f'{entry["time"]}</span>',
+                unsafe_allow_html=True,
+            )
+        with col_s:
+            st.markdown(
+                f'<span style="color:#ffffff;font-weight:600;font-size:0.82rem">'
+                f'{entry["label"].upper()}</span>',
+                unsafe_allow_html=True,
+            )
+        with col_c:
+            st.markdown(
+                f'<span style="color:#22c55e;font-weight:500;font-size:0.82rem">'
+                f'{entry["confidence"]:.0%}</span>',
+                unsafe_allow_html=True,
+            )
+        with col_d:
+            if st.button("Delete", key=f"del_hist_{idx}", use_container_width=True):
+                st.session_state._history_deletes.append(idx)
+                st.rerun()
+
+    # Process pending deletions (delete from highest index first to avoid shifting)
+    if st.session_state._history_deletes:
+        with state.lock:
+            for idx in sorted(st.session_state._history_deletes, reverse=True):
+                if 0 <= idx < len(state.history):
+                    state.history.pop(idx)
+        st.session_state._history_deletes = []
 
 
 def render_instructions(model, label_encoder):
@@ -1044,7 +1098,7 @@ def main():
             render_stat_cards(history_snapshot)
 
             st.markdown("#### Recognition History")
-            render_history_list(history_snapshot)
+            render_history_list(state)
 
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1077,6 +1131,12 @@ def main():
                         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
                         try:
+                            # Debug: log image properties
+                            print(
+                                f"[SignSpeak] Photo mp.Image: "
+                                f"{mp_image.width}x{mp_image.height}, "
+                                f"dtype={rgb.dtype}, shape={rgb.shape}"
+                            )
                             results = landmarker.detect(mp_image)
                         except Exception as e:
                             st.error(f"MediaPipe detection error: {e}")
