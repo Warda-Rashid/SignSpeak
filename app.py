@@ -1,13 +1,11 @@
-"""
-app.py
-------
-SignSpeak live sign-language recognition web app.
+"""app.py — SignSpeak live sign-language recognition web app.
 
 Two modes:
-  - Live Camera  : continuous webcam stream via streamlit-webrtc (getUserMedia)
-                   with real-time MediaPipe landmark detection + ML prediction
+  - Live Camera  : periodic webcam capture via st.camera_input (browser-native)
+                   with MediaPipe landmark detection + ML prediction
                    + stability filtering + deduplicated sign history.
-  - Photo Capture: single-shot fallback (uses st.camera_input).
+                   Works on both local and Streamlit Cloud.
+  - Photo Capture: single-shot fallback (same pipeline, no auto-refresh).
 
 Usage:
     streamlit run app.py
@@ -27,8 +25,7 @@ import threading
 from collections import deque
 from datetime import datetime
 
-# Live camera + auto-refresh
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
+# Auto-refresh for periodic camera capture
 from streamlit_autorefresh import st_autorefresh
 
 # Optional text-to-speech (only works locally)
@@ -476,149 +473,120 @@ def speak_sign(label):
 
 
 # ─────────────────────────────────────────────────────────
-# Video frame callback (core recognition pipeline)
+# Frame processing (core recognition pipeline)
 # ─────────────────────────────────────────────────────────
-def make_video_frame_callback(state, landmarker, model, scaler, label_encoder):
-    """Return a frame callback that runs the full recognition pipeline.
+def process_camera_frame(img, state, landmarker, model, scaler, label_encoder):
+    """Process a BGR camera frame through the full recognition pipeline.
 
-    The callback is recreated each Streamlit rerun so it always sees the
-    latest session state and configuration values.
+    Runs MediaPipe hand detection, ML prediction, stability tracking,
+    and frame annotation.  Returns the annotated BGR frame.
     """
+    img = cv2.flip(img, 1)  # mirror effect
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    def video_frame_callback(frame):
-        try:
-            # Convert incoming av.VideoFrame → numpy BGR
-            img = frame.to_ndarray(format="bgr24")
-            img = cv2.flip(img, 1)  # mirror effect
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    # Monotonic timestamp (ms) for VIDEO mode tracking
+    with state.lock:
+        state.frame_ts_ms += 33
+        ts = state.frame_ts_ms
+    results = landmarker.detect_for_video(mp_image, ts)
 
-            # Monotonic timestamp (ms) for VIDEO mode tracking
-            with state.lock:
-                state.frame_ts_ms += 33
-                ts = state.frame_ts_ms
-            results = landmarker.detect_for_video(mp_image, ts)
+    hand_detected = len(results.hand_landmarks) > 0
 
-            hand_detected = len(results.hand_landmarks) > 0
+    if hand_detected:
+        for hl in results.hand_landmarks:
+            _draw_hand_skeleton(img, hl)
 
-            if hand_detected:
-                # Draw skeleton
-                for hl in results.hand_landmarks:
-                    _draw_hand_skeleton(img, hl)
+        hand_lms = results.hand_landmarks[0]
+        feats = np.array(
+            [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
+            dtype=np.float64,
+        ).reshape(1, -1)
 
-                # Extract 63 features (21 landmarks × x, y, z)
-                hand_lms = results.hand_landmarks[0]
-                feats = np.array(
-                    [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
-                    dtype=np.float64,
-                ).reshape(1, -1)
+        feats_scaled = scaler.transform(feats)
+        probs = model.predict_proba(feats_scaled)[0]
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        enc_class = model.classes_[idx]
+        label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
 
-                # Predict
-                feats_scaled = scaler.transform(feats)
-                probs = model.predict_proba(feats_scaled)[0]
-                idx = int(np.argmax(probs))
-                conf = float(probs[idx])
-                enc_class = model.classes_[idx]
-                label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
+        # Stability tracking
+        now = time.time()
+        with state.lock:
+            state.stability_deque.append((label, conf))
+            threshold = state.threshold
+            stable_n = state.stable_frames
+            buf = list(state.stability_deque)
 
-                # Stability tracking
-                now = time.time()
-                with state.lock:
-                    state.stability_deque.append((label, conf))
-                    threshold = state.threshold
-                    stable_n = state.stable_frames
-                    buf = list(state.stability_deque)
+            if len(buf) == stable_n:
+                labels = [x[0] for x in buf]
+                confs = [x[1] for x in buf]
+                all_same = all(lb == labels[0] for lb in labels)
+                all_conf_ok = all(c >= threshold for c in confs)
 
-                    if len(buf) == stable_n:
-                        labels = [x[0] for x in buf]
-                        confs = [x[1] for x in buf]
-                        # Stable when ALL frames have the same label and all confs >= threshold
-                        all_same = all(lb == labels[0] for lb in labels)
-                        all_conf_ok = all(c >= threshold for c in confs)
-
-                        if all_same and all_conf_ok:
-                            accepted_label = labels[0]
-                            accepted_conf = float(np.mean(confs))
-
-                            # Dedup logic: save only when different from last saved
-                            # OR same sign after absence cooldown has passed
-                            can_save = (
-                                state.last_saved_label is None
-                                or accepted_label != state.last_saved_label
-                                or (now - state.last_absent_at >= ABSENCE_COOLDOWN)
-                            )
-                            if can_save:
-                                state.history.append({
-                                    "label": accepted_label,
-                                    "confidence": accepted_conf,
-                                    "time": datetime.now().strftime("%H:%M:%S"),
-                                })
-                                state.last_saved_label = accepted_label
-                                state.last_absent_at = now
-                                if state.speak_enabled:
-                                    speak_sign(accepted_label)
-
-                            state.current_label = accepted_label
-                            state.current_confidence = accepted_conf
-                            state.current_status = "sign_detected"
-                            state.stability_progress = 1.0
-                        else:
-                            # Not yet stable — show current prediction with progress
-                            state.current_label = label
-                            state.current_confidence = conf
-                            # Count trailing consecutive same-label frames
-                            run = 1
-                            for i in range(len(labels) - 2, -1, -1):
-                                if labels[i] == label:
-                                    run += 1
-                                else:
-                                    break
-                            state.stability_progress = run / stable_n
-                            if conf < threshold:
-                                state.current_status = "low_confidence"
-                            else:
-                                state.current_status = "recognizing"
-                    else:
-                        # Buffer filling
-                        state.current_label = label
-                        state.current_confidence = conf
-                        state.stability_progress = len(buf) / stable_n
-                        state.current_status = "recognizing"
-
-                    # Mark hand present
-                    state.last_absent_at = now
-
-                # Annotate frame
-                if state.current_status == "sign_detected":
-                    _draw_overlay(img, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
-                elif state.current_status == "low_confidence":
-                    _draw_overlay(img, f"Low conf: {conf:.0%}", (100, 180, 255))
-                else:
-                    _draw_overlay(img, f"{label}  {conf:.0%}", (220, 220, 220))
-                _draw_stability_bar(img, state.stability_progress)
-
-            else:
-                # No hand detected
-                with state.lock:
-                    now = time.time()
-                    # Update absence timestamp only when hand was previously present
-                    if state.current_status != "no_hand":
+                if all_same and all_conf_ok:
+                    accepted_label = labels[0]
+                    accepted_conf = float(np.mean(confs))
+                    can_save = (
+                        state.last_saved_label is None
+                        or accepted_label != state.last_saved_label
+                        or (now - state.last_absent_at >= ABSENCE_COOLDOWN)
+                    )
+                    if can_save:
+                        state.history.append({
+                            "label": accepted_label,
+                            "confidence": accepted_conf,
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                        })
+                        state.last_saved_label = accepted_label
                         state.last_absent_at = now
-                    state.stability_deque.clear()
-                    state.current_status = "no_hand"
-                    state.current_label = None
-                    state.current_confidence = 0.0
-                    state.stability_progress = 0.0
-                _draw_overlay(img, "No hand — show your hand", (180, 180, 180))
+                        if state.speak_enabled:
+                            speak_sign(accepted_label)
+                    state.current_label = accepted_label
+                    state.current_confidence = accepted_conf
+                    state.current_status = "sign_detected"
+                    state.stability_progress = 1.0
+                else:
+                    state.current_label = label
+                    state.current_confidence = conf
+                    run = 1
+                    for i in range(len(labels) - 2, -1, -1):
+                        if labels[i] == label:
+                            run += 1
+                        else:
+                            break
+                    state.stability_progress = run / stable_n
+                    state.current_status = (
+                        "low_confidence" if conf < threshold else "recognizing"
+                    )
+            else:
+                state.current_label = label
+                state.current_confidence = conf
+                state.stability_progress = len(buf) / stable_n
+                state.current_status = "recognizing"
+            state.last_absent_at = now
 
-        except Exception as exc:
-            # Graceful degradation — never crash the frame pipeline
-            _draw_overlay(img, "Error processing frame", (100, 100, 255))
+        # Annotate frame
+        if state.current_status == "sign_detected":
+            _draw_overlay(img, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
+        elif state.current_status == "low_confidence":
+            _draw_overlay(img, f"Low conf: {conf:.0%}", (100, 180, 255))
+        else:
+            _draw_overlay(img, f"{label}  {conf:.0%}", (220, 220, 220))
+        _draw_stability_bar(img, state.stability_progress)
+    else:
+        with state.lock:
+            now = time.time()
+            if state.current_status != "no_hand":
+                state.last_absent_at = now
+            state.stability_deque.clear()
+            state.current_status = "no_hand"
+            state.current_label = None
+            state.current_confidence = 0.0
+            state.stability_progress = 0.0
+        _draw_overlay(img, "No hand — show your hand", (180, 180, 180))
 
-        import av
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-    return video_frame_callback
+    return img
 
 
 # ─────────────────────────────────────────────────────────
@@ -672,15 +640,12 @@ def render_sidebar(model, label_encoder, state):
             state.last_absent_at = 0.0
 
     if st.sidebar.button("Release Camera", use_container_width=True,
-                         help="Force release the camera if it's stuck or showing 'Device in use' error"):
-        # Reset Streamlit-side camera state
-        st.session_state.camera_in_use = False
-        st.session_state.camera_start_requested = False
-        st.session_state.camera_start_error = None
+                         help="Force release the camera and refresh the page"):
+        # Reset camera state
+        st.session_state.camera_active = False
         # Inject JS to release camera and trigger refresh
         components.html("""
         <script>
-        // Aggressively stop all video tracks in every iframe
         function killAll() {
             document.querySelectorAll('video, audio').forEach(el => {
                 if (el.srcObject) {
@@ -688,7 +653,6 @@ def render_sidebar(model, label_encoder, state):
                     el.srcObject = null;
                 }
             });
-            // Also probe+release to clear stale OS-level handles
             if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
                 navigator.mediaDevices.getUserMedia({video:true,audio:false})
                     .then(s => { s.getTracks().forEach(t=>t.stop()); })
@@ -696,7 +660,6 @@ def render_sidebar(model, label_encoder, state):
             }
         }
         killAll();
-        // Also run in parent document
         try { window.parent.releaseAllCameras && window.parent.releaseAllCameras(); } catch(e) {}
         setTimeout(() => { window.parent.location.reload(); }, 600);
         </script>
@@ -921,120 +884,73 @@ def main():
 
     # ── LIVE CAMERA TAB ────────────────────────────────────
     with tab_live:
-        # Track if camera is in use (for warning in Photo Capture tab)
-        if "camera_in_use" not in st.session_state:
-            st.session_state.camera_in_use = False
-        if "camera_start_requested" not in st.session_state:
-            st.session_state.camera_start_requested = False
+        if "camera_active" not in st.session_state:
+            st.session_state.camera_active = False
 
         col_feed, col_panel = st.columns([3, 2], gap="medium")
 
         with col_feed:
             st.markdown("#### Camera Preview")
 
-            # Build callback (captures current state + resources)
-            callback = make_video_frame_callback(state, landmarker, model, scaler, label_encoder)
+            # Camera input — uses the browser's native camera API
+            # (works on both local AND Streamlit Cloud, no WebRTC needed)
+            camera_image = st.camera_input(
+                "Capture a frame",
+                key="live_cam",
+                help="Click the camera icon to capture. "
+                     "Frames auto-refresh while the camera is active.",
+            )
 
-            webrtc_ctx = None
-
-            if st.session_state.camera_start_requested:
-                # Only render webrtc_streamer when the user explicitly
-                # clicked Start.  This prevents the browser from auto-
-                # grabbing getUserMedia on every page load, which is
-                # the root cause of NotReadableError: Device in use
-                # when a stale stream from a previous session still
-                # holds the device handle.
-                try:
-                    webrtc_ctx = webrtc_streamer(
-                        key="signcam",
-                        mode=WebRtcMode.SENDRECV,
-                        rtc_configuration={
-                            "iceServers": []  # No STUN needed for localhost
-                        },
-                        media_stream_constraints={
-                            "video": {
-                                "width": {"ideal": 640},
-                                "height": {"ideal": 480},
-                                "facingMode": "user"
-                            },
-                            "audio": False
-                        },
-                        video_frame_callback=callback,
-                        async_processing=True,
-                        desired_playing_state=True,
+            # Process the captured frame
+            if camera_image is not None:
+                file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
+                frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frame = process_camera_frame(
+                        frame, state, landmarker, model, scaler, label_encoder
                     )
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    st.session_state.camera_start_requested = False
-                    st.session_state.camera_start_error = (
-                        "no_device" if "notfound" in err_msg
-                        else "device_busy" if "notreadable" in err_msg or "in use" in err_msg
-                        else "other"
-                    )
-                    webrtc_ctx = None
-
-                # Sync flags with the actual webrtc state
-                if webrtc_ctx and webrtc_ctx.state.playing:
-                    st.session_state.camera_in_use = True
-                    with state.lock:
-                        if state.current_status in ("stopped", "ready"):
-                            state.current_status = "ready"
-                elif webrtc_ctx and not webrtc_ctx.state.playing and not webrtc_ctx.state.signalling:
-                    st.session_state.camera_in_use = False
-                    with state.lock:
-                        if state.current_status not in ("ready", "sign_detected"):
-                            state.current_status = "stopped" if state.history else "ready"
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    st.image(frame_rgb, use_container_width=True)
+                    st.session_state.camera_active = True
+                else:
+                    st.error("Could not decode the captured image.")
             else:
-                # Show a clean placeholder until the user clicks Start
-                err = st.session_state.get("camera_start_error")
                 st.markdown("""
                 <div class="camera-start-placeholder">
                     <div class="icon">📹</div>
                     <div class="title">Camera Ready</div>
-                    <div class="hint">Click <strong>Start Camera</strong> below to begin live recognition</div>
+                    <div class="hint">
+                        Click the <strong>camera button</strong> above to start.<br/>
+                        Frames will auto-refresh every 3 seconds while active.
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
-                if err == "device_busy":
-                    st.error(
-                        "Camera is busy — another app or tab is using it. "
-                        "Close other camera apps, then click **Release Camera** in the sidebar and try again."
-                    )
-                elif err == "no_device":
-                    st.error(
-                        "No camera detected. Make sure a webcam is connected and enabled."
-                    )
-                elif err == "other":
-                    st.error(
-                        "Camera could not start. Try refreshing the page or using a different browser."
-                    )
+            # Auto-refresh while camera is active (re-captures periodically)
+            if st.session_state.camera_active and camera_image is not None:
+                st_autorefresh(interval=3000, key="live_refresh")
 
-                if st.button("Start Camera", use_container_width=True, type="primary"):
-                    st.session_state.camera_start_requested = True
-                    st.session_state.camera_start_error = None
+            # Stop button
+            if st.session_state.camera_active:
+                if st.button("Stop Camera", use_container_width=True):
+                    st.session_state.camera_active = False
                     st.rerun()
 
-            # Troubleshooting (collapsible — does not steal viewport space)
+            # Troubleshooting (collapsible)
             with st.expander("Camera not starting? Troubleshooting tips"):
                 st.markdown("""
                 | Error | Cause | Fix |
                 |-------|-------|-----|
-                | `NotReadableError: Device in use` | Another app/tab has the camera | Close other apps or click **Release Camera** in sidebar |
                 | `NotAllowedError` | Camera permission denied | Click the camera icon in the address bar and allow access |
                 | `NotFoundError` | No camera detected | Check that your webcam is connected and enabled |
                 | Camera won't start | Not a secure context | Use `http://localhost` or `https://` |
-                | Black screen | Stream not initializing | Refresh the page (Ctrl+F5) |
+                | Black screen | Browser camera issue | Refresh the page (Ctrl+F5) |
 
                 **Quick fixes:**
-                1. Close other apps using the camera (Zoom, Teams, other tabs)
-                2. Click **Release Camera** in the sidebar
+                1. Grant camera permission when prompted
+                2. Close other apps using the camera (Zoom, Teams, other tabs)
                 3. Refresh the page (Ctrl+F5)
-                4. Check browser permissions — lock/camera icon in the address bar
                 """)
-
-            # Live autorefresh only while the stream is active
-            if webrtc_ctx and (webrtc_ctx.state.playing or webrtc_ctx.state.signalling):
-                st_autorefresh(interval=600, key="live_ui_refresh")
 
             render_instructions(model, label_encoder)
 
@@ -1061,18 +977,10 @@ def main():
     with tab_photo:
         st.markdown("#### Single Photo Capture")
 
-        # Show warning if Live Camera is active
-        if st.session_state.get("camera_in_use", False):
-            st.warning(
-                "⚠️ **The Live Camera is currently active.** "
-                "The camera can only be used by one mode at a time. "
-                "Please **click the 'Stop' button** in the Live Camera tab before using Photo Capture."
-            )
-        else:
-            st.info(
-                "This mode takes a single photo and predicts the sign. "
-                "For continuous recognition with stability filtering, use the **Live Camera** tab."
-            )
+        st.info(
+            "Take a single photo of your hand sign and get an instant prediction. "
+            "For continuous recognition with auto-refresh, use the **Live Camera** tab."
+        )
 
         camera_image = st.camera_input(
             "Take a photo of your hand sign",
