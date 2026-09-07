@@ -1111,146 +1111,211 @@ def main():
             "For continuous recognition with auto-refresh, use the **Live Camera** tab."
         )
 
-        camera_image = st.camera_input(
-            "Take a photo of your hand sign",
-            help="Position your hand clearly in the frame and click the capture button",
-        )
+        # Two-column layout: camera feed | prediction + history
+        photo_col_feed, photo_col_panel = st.columns([3, 2], gap="medium")
 
-        if camera_image is not None:
-            try:
-                file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
-                if file_bytes.size == 0:
-                    st.warning("Captured image is empty. Please try again.")
-                else:
-                    frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        with photo_col_feed:
+            camera_image = st.camera_input(
+                "Take a photo of your hand sign",
+                help="Position your hand clearly in the frame and click the capture button",
+            )
 
-                    if _is_valid_frame(frame):
-                        frame = cv2.flip(frame, 1)
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-                        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-                        try:
-                            # Debug: log image properties
-                            print(
-                                f"[SignSpeak] Photo mp.Image: "
-                                f"{mp_image.width}x{mp_image.height}, "
-                                f"dtype={rgb.dtype}, shape={rgb.shape}"
-                            )
-                            results = landmarker.detect(mp_image)
-                        except Exception as e:
-                            st.error(f"MediaPipe detection error: {e}")
-                            print(f"[SignSpeak] Photo capture detect error: {e}")
-                            traceback.print_exc()
-                            results = None
-
-                        if results is not None:
-                            hand_detected = len(results.hand_landmarks) > 0
-                            n_hands = len(results.hand_landmarks)
-
-                            # Always draw detection debug info
-                            _draw_overlay(
-                                frame, f"Hands detected: {n_hands}",
-                                (200, 200, 200), y=65, scale=0.6, thickness=1
-                            )
-
-                            if hand_detected:
-                                _draw_hand_skeleton(frame, results.hand_landmarks[0])
-                                hand_lms = results.hand_landmarks[0]
-                                feats = np.array(
-                                    [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
-                                    dtype=np.float64,
-                                ).reshape(1, -1)
-                                feats_scaled = scaler.transform(feats)
-                                probs = model.predict_proba(feats_scaled)[0]
-                                idx = int(np.argmax(probs))
-                                conf = float(probs[idx])
-                                enc_class = model.classes_[idx]
-                                label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
-
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                st.image(frame_rgb, use_container_width=True)
-
-                                # Clear result feedback
-                                if conf >= state.threshold:
-                                    _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
-                                    st.success(
-                                        f"**Recognized sign: {label.upper()}** "
-                                        f"with {conf:.0%} confidence"
-                                    )
-                                    with state.lock:
-                                        if not state.history or state.history[-1]["label"] != label:
-                                            state.history.append({
-                                                "label": label,
-                                                "confidence": conf,
-                                                "time": datetime.now().strftime("%H:%M:%S"),
-                                            })
-                                            st.success(
-                                                f"Saved to history: **{label.upper()}** "
-                                                f"({conf:.0%})"
-                                            )
-                                        else:
-                                            st.info(
-                                                f"Already in history: **{label.upper()}** — "
-                                                f"show a different sign or wait "
-                                                f"{ABSENCE_COOLDOWN:.0f}s to re-record"
-                                            )
-                                else:
-                                    st.warning(
-                                        f"Prediction: **{label}** but only "
-                                        f"{conf:.0%} confidence (threshold: "
-                                        f"{state.threshold:.0%}). "
-                                        f"Hold your sign steadier or improve lighting."
-                                    )
-                            else:
-                                _draw_overlay(frame, "No hand detected", (180, 180, 180))
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                st.image(frame_rgb, use_container_width=True)
-                                st.warning(
-                                    "No hand detected — make sure your hand is "
-                                    "clearly visible in the frame and well-lit. "
-                                    "Try holding it closer to the camera."
-                                )
+            if camera_image is not None:
+                try:
+                    file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
+                    if file_bytes.size == 0:
+                        st.warning("Captured image is empty. Please try again.")
                     else:
-                        st.warning(
-                            f"Captured image could not be decoded properly "
-                            f"(shape: {frame.shape if frame is not None else 'None'}). "
-                            "Please try again."
+                        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+                        # Debug: log raw frame info
+                        print(
+                            f"[SignSpeak] Photo raw frame: shape={frame.shape if frame is not None else None}, "
+                            f"dtype={frame.dtype if frame is not None else None}"
                         )
-            except Exception as e:
-                st.error(f"Error processing photo: {e}")
-                print(f"[SignSpeak] Photo capture error: {e}")
-                traceback.print_exc()
-        else:
-            st.markdown("""
-            <div class="camera-idle">
-                <div class="icon">📷</div>
-                <div style="font-weight:500; color:rgba(255,255,255,0.6);">Camera ready</div>
-                <div style="margin-top:0.3rem;">Click the camera button above to capture a sign.</div>
-            </div>
-            """, unsafe_allow_html=True)
 
-        # Camera troubleshooting
-        st.markdown("")
-        with st.expander("🔧 Camera not working? Click here for help"):
-            st.markdown("""
-            **Common camera issues and solutions:**
+                        if _is_valid_frame(frame):
+                            frame = cv2.flip(frame, 1)
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            | Error | Cause | Solution |
-            |-------|-------|----------|
-            | `NotReadableError: Device in use` | Another app or browser tab is using the camera | Close other apps/tabs using the camera, or **click 'Stop'** in the Live Camera tab |
-            | `NotAllowedError` | Camera permission denied | Click the camera icon in your browser's address bar and allow camera access |
-            | `NotFoundError` | No camera detected | Check that your webcam is connected and not disabled |
-            | Camera won't start | Accessing via HTTP (not localhost) | Use `http://localhost:8501` or `https://` (browsers require secure context for camera) |
-            | Black screen | Camera permissions granted but stream not starting | Refresh the page and try again |
+                            try:
+                                # Debug: log image properties before detect()
+                                print(
+                                    f"[SignSpeak] Photo mp.Image: "
+                                    f"{mp_image.width}x{mp_image.height}, "
+                                    f"dtype={rgb.dtype}, shape={rgb.shape}"
+                                )
+                                results = landmarker.detect(mp_image)
+                                print(
+                                    f"[SignSpeak] Photo detect result: "
+                                    f"n_hands={len(results.hand_landmarks)}"
+                                )
+                            except Exception as e:
+                                st.error(f"MediaPipe detection error: {e}")
+                                print(f"[SignSpeak] Photo capture detect error: {e}")
+                                traceback.print_exc()
+                                results = None
 
-            **Quick fixes:**
-            1. **Close other apps** that might be using the camera (Zoom, Teams, other browser tabs)
-            2. **Refresh the page** (Ctrl+F5 or Cmd+Shift+R)
-            3. **Check browser permissions** — click the lock/camera icon in the address bar
-            4. **Try a different browser** (Chrome, Firefox, Edge all work)
-            5. **Restart the app** if the camera is stuck
-            """)
+                            if results is not None:
+                                hand_detected = len(results.hand_landmarks) > 0
+                                n_hands = len(results.hand_landmarks)
+
+                                # Always draw detection debug info
+                                _draw_overlay(
+                                    frame, f"Hands detected: {n_hands}",
+                                    (200, 200, 200), y=65, scale=0.6, thickness=1
+                                )
+
+                                if hand_detected:
+                                    _draw_hand_skeleton(frame, results.hand_landmarks[0])
+                                    hand_lms = results.hand_landmarks[0]
+                                    feats = np.array(
+                                        [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
+                                        dtype=np.float64,
+                                    ).reshape(1, -1)
+                                    feats_scaled = scaler.transform(feats)
+                                    probs = model.predict_proba(feats_scaled)[0]
+                                    idx = int(np.argmax(probs))
+                                    conf = float(probs[idx])
+                                    enc_class = model.classes_[idx]
+                                    label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
+
+                                    print(
+                                        f"[SignSpeak] Photo prediction: "
+                                        f"label={label}, conf={conf:.2%}"
+                                    )
+
+                                    # ── Update the recognition state so
+                                    #    "Current Prediction" panel reflects
+                                    #    this result immediately.
+                                    now = time.time()
+                                    with state.lock:
+                                        state.current_label = label
+                                        state.current_confidence = conf
+                                        if conf >= state.threshold:
+                                            state.current_status = "sign_detected"
+                                        else:
+                                            state.current_status = "low_confidence"
+                                        state.stability_progress = 1.0
+
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    st.image(frame_rgb, use_container_width=True)
+
+                                    # Clear result feedback
+                                    if conf >= state.threshold:
+                                        _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
+                                        st.success(
+                                            f"**Recognized sign: {label.upper()}** "
+                                            f"with {conf:.0%} confidence"
+                                        )
+                                        with state.lock:
+                                            if not state.history or state.history[-1]["label"] != label:
+                                                state.history.append({
+                                                    "label": label,
+                                                    "confidence": conf,
+                                                    "time": datetime.now().strftime("%H:%M:%S"),
+                                                })
+                                                st.success(
+                                                    f"Saved to history: **{label.upper()}** "
+                                                    f"({conf:.0%})"
+                                                )
+                                            else:
+                                                st.info(
+                                                    f"Already in history: **{label.upper()}** — "
+                                                    f"show a different sign or wait "
+                                                    f"{ABSENCE_COOLDOWN:.0f}s to re-record"
+                                                )
+                                    else:
+                                        st.warning(
+                                            f"Prediction: **{label}** but only "
+                                            f"{conf:.0%} confidence (threshold: "
+                                            f"{state.threshold:.0%}). "
+                                            f"Hold your sign steadier or improve lighting."
+                                        )
+                                else:
+                                    print("[SignSpeak] Photo: no hands detected")
+                                    _draw_overlay(frame, "No hand detected", (180, 180, 180))
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    st.image(frame_rgb, use_container_width=True)
+
+                                    # Update state to reflect no-hand
+                                    with state.lock:
+                                        state.current_label = None
+                                        state.current_status = "no_hand"
+
+                                    st.warning(
+                                        "No hand detected — make sure your hand is "
+                                        "clearly visible in the frame and well-lit. "
+                                        "Try holding it closer to the camera."
+                                    )
+
+                            else:
+                                # Detection failed entirely
+                                with state.lock:
+                                    state.current_label = None
+                                    state.current_status = "error"
+                                _draw_overlay(frame, "Detection error", (100, 100, 255))
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                st.image(frame_rgb, use_container_width=True)
+                        else:
+                            st.warning(
+                                f"Captured image could not be decoded properly "
+                                f"(shape: {frame.shape if frame is not None else 'None'}). "
+                                "Please try again."
+                            )
+                except Exception as e:
+                    st.error(f"Error processing photo: {e}")
+                    print(f"[SignSpeak] Photo capture error: {e}")
+                    traceback.print_exc()
+            else:
+                st.markdown("""
+                <div class="camera-idle">
+                    <div class="icon">📷</div>
+                    <div style="font-weight:500; color:rgba(255,255,255,0.6);">Camera ready</div>
+                    <div style="margin-top:0.3rem;">Click the camera button above to capture a sign.</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Camera troubleshooting
+            st.markdown("")
+            with st.expander("🔧 Camera not working? Click here for help"):
+                st.markdown("""
+                **Common camera issues and solutions:**
+
+                | Error | Cause | Solution |
+                |-------|-------|----------|
+                | `NotReadableError: Device in use` | Another app or browser tab is using the camera | Close other apps/tabs using the camera, or **click 'Stop'** in the Live Camera tab |
+                | `NotAllowedError` | Camera permission denied | Click the camera icon in your browser's address bar and allow camera access |
+                | `NotFoundError` | No camera detected | Check that your webcam is connected and not disabled |
+                | Camera won't start | Accessing via HTTP (not localhost) | Use `http://localhost:8501` or `https://` (browsers require secure context for camera) |
+                | Black screen | Camera permissions granted but stream not starting | Refresh the page and try again |
+
+                **Quick fixes:**
+                1. **Close other apps** that might be using the camera (Zoom, Teams, other browser tabs)
+                2. **Refresh the page** (Ctrl+F5 or Cmd+Shift+R)
+                3. **Check browser permissions** — click the lock/camera icon in the address bar
+                4. **Try a different browser** (Chrome, Firefox, Edge all work)
+                5. **Restart the app** if the camera is stuck
+                """)
+
+        # ── Photo Capture: Right Panel ────────────────────
+        with photo_col_panel:
+            st.markdown('<div class="panel-tight">', unsafe_allow_html=True)
+
+            st.markdown("#### Current Prediction")
+            render_prediction_panel(state)
+
+            st.markdown("#### Session Statistics")
+            with state.lock:
+                history_snapshot = list(state.history)
+            render_stat_cards(history_snapshot)
+
+            st.markdown("#### Recognition History")
+            render_history_list(state)
+
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
