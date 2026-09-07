@@ -3,6 +3,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.local
 
 # Training data (can be regenerated locally)
 sign_data.csv
@@ -12,6 +25,7 @@ sign_data.csv
 .idea/
 *.swp
 *.swo
+*~
 
 # Qoder
 .qoder/
@@ -20,7 +34,11 @@ sign_data.csv
 .DS_Store
 Thumbs.db
 
-# Environment
-.env
-venv/
-.venv/
+# Screenshots / demo images (regenerable)
+screenshot_*.png
+
+# Streamlit secrets (NEVER push API keys)
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
