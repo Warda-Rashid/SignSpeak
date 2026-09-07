@@ -1199,7 +1199,12 @@ def main():
                                     f"{mp_image.width}x{mp_image.height}, "
                                     f"dtype={rgb.dtype}, shape={rgb.shape}"
                                 )
-                                results = landmarker.detect(mp_image)
+                                # Use detect_for_video() because landmarker is in VIDEO mode.
+                                # detect() would raise ValueError on a VIDEO-mode landmarker.
+                                with state.lock:
+                                    state.frame_ts_ms += 33
+                                    ts = state.frame_ts_ms
+                                results = landmarker.detect_for_video(mp_image, ts)
                                 print(
                                     f"[SignSpeak] Photo detect result: "
                                     f"n_hands={len(results.hand_landmarks)}"
