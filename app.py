@@ -437,29 +437,40 @@ def _draw_stability_bar(frame, progress, y_offset=0):
 
 
 def _draw_hand_skeleton(frame, hand_landmarks):
-    """Draw hand skeleton overlay with visible joints and connections."""
+    """Draw hand skeleton overlay with visible joints and connections.
+
+    Drawing size scales with image resolution so the overlay stays visible
+    on high-resolution camera frames displayed at reduced width.
+    """
     h, w, _ = frame.shape
+    scale = max(h, w) / 640.0  # scale factor relative to 640-wide reference
+    line_w = max(2, int(3 * scale))
+    joint_r = max(4, int(5 * scale))
+    tip_r = max(5, int(7 * scale))
+    wrist_r = max(6, int(8 * scale))
+    outline = max(1, int(2 * scale))
+
     points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
 
-    # Draw connections (thicker for visibility)
+    # Draw connections (scaled thickness for visibility)
     for s, e in HAND_CONNECTIONS:
-        cv2.line(frame, points[s], points[e], (0, 200, 120), 3, cv2.LINE_AA)
+        cv2.line(frame, points[s], points[e], (0, 200, 120), line_w, cv2.LINE_AA)
 
     # Draw joint circles — larger for visibility
     TIP_IDS = {4, 8, 12, 16, 20}  # fingertip landmark indices
     for i, p in enumerate(points):
         if i == 0:
             # Wrist — larger, different color
-            cv2.circle(frame, p, 8, (255, 100, 0), -1)
-            cv2.circle(frame, p, 8, (255, 255, 255), 2)
+            cv2.circle(frame, p, wrist_r, (255, 100, 0), -1)
+            cv2.circle(frame, p, wrist_r, (255, 255, 255), outline)
         elif i in TIP_IDS:
-            # Fingertips — highlighted
-            cv2.circle(frame, p, 7, (0, 255, 255), -1)
-            cv2.circle(frame, p, 7, (255, 255, 255), 2)
+            # Fingertips — highlighted yellow
+            cv2.circle(frame, p, tip_r, (0, 255, 255), -1)
+            cv2.circle(frame, p, tip_r, (255, 255, 255), outline)
         else:
-            # Regular joints
-            cv2.circle(frame, p, 5, (0, 255, 0), -1)
-            cv2.circle(frame, p, 5, (255, 255, 255), 1)
+            # Regular joints — green
+            cv2.circle(frame, p, joint_r, (0, 255, 0), -1)
+            cv2.circle(frame, p, joint_r, (255, 255, 255), outline)
 
 
 # ─────────────────────────────────────────────────────────
@@ -1187,10 +1198,9 @@ def main():
                                         f"label={label}, conf={conf:.2%}"
                                     )
 
-                                    # ── Update the recognition state so
-                                    #    "Current Prediction" panel reflects
-                                    #    this result immediately.
-                                    now = time.time()
+                                    # Update the recognition state so
+                                    # "Current Prediction" panel reflects
+                                    # this result immediately.
                                     with state.lock:
                                         state.current_label = label
                                         state.current_confidence = conf
@@ -1200,12 +1210,17 @@ def main():
                                             state.current_status = "low_confidence"
                                         state.stability_progress = 1.0
 
+                                    # Draw prediction label BEFORE display
+                                    if conf >= state.threshold:
+                                        _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
+                                    else:
+                                        _draw_overlay(frame, f"Low conf: {conf:.0%}", (100, 180, 255))
+
                                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                     st.image(frame_rgb, use_container_width=True)
 
-                                    # Clear result feedback
+                                    # Show result feedback in the UI
                                     if conf >= state.threshold:
-                                        _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
                                         st.success(
                                             f"**Recognized sign: {label.upper()}** "
                                             f"with {conf:.0%} confidence"
