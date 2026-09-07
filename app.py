@@ -1043,6 +1043,8 @@ def main():
 
             # Process the captured frame
             if camera_image is not None:
+                # Show that detection is active
+                st.caption("✅ **Detection active** — frame captured. Showing results below.")
                 try:
                     file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
                     if file_bytes.size == 0:
@@ -1097,12 +1099,17 @@ def main():
                     traceback.print_exc()
             else:
                 st.markdown("""
-                <div class="camera-start-placeholder">
-                    <div class="icon">📹</div>
-                    <div class="title">Camera Ready</div>
-                    <div class="hint">
-                        Click the <strong>camera button</strong> above to start.<br/>
-                        Frames will auto-refresh every 3 seconds while active.
+                <div style="background:linear-gradient(135deg,#1e3a5f,#0e1117);
+                            border:2px solid #3b82f6; border-radius:12px;
+                            padding:1.2rem; text-align:center; margin-top:0.5rem;">
+                    <div style="font-size:1.8rem;">👆</div>
+                    <div style="font-size:1.1rem; font-weight:700; color:#3b82f6; margin-bottom:0.3rem;">
+                        Click the camera button above to start detection
+                    </div>
+                    <div style="font-size:0.85rem; color:rgba(255,255,255,0.5);">
+                        The camera preview shows a live feed, but detection only runs
+                        <strong style="color:#22c55e;">after you click the shutter icon</strong>
+                        inside the camera widget. Once captured, frames auto-refresh every 3 seconds.
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1336,10 +1343,18 @@ def main():
                     traceback.print_exc()
             else:
                 st.markdown("""
-                <div class="camera-idle">
-                    <div class="icon">📷</div>
-                    <div style="font-weight:500; color:rgba(255,255,255,0.6);">Camera ready</div>
-                    <div style="margin-top:0.3rem;">Click the camera button above to capture a sign.</div>
+                <div style="background:linear-gradient(135deg,#1e3a5f,#0e1117);
+                            border:2px solid #3b82f6; border-radius:12px;
+                            padding:1.2rem; text-align:center; margin-top:0.5rem;">
+                    <div style="font-size:1.8rem;">👆</div>
+                    <div style="font-size:1.1rem; font-weight:700; color:#3b82f6; margin-bottom:0.3rem;">
+                        Click the shutter icon inside the camera widget above
+                    </div>
+                    <div style="font-size:0.85rem; color:rgba(255,255,255,0.5);">
+                        The camera preview shows a live feed, but detection only runs
+                        <strong style="color:#22c55e;">after you click the capture button</strong>
+                        inside the widget. Hold your hand steady, then click to capture.
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
