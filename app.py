@@ -22,6 +22,7 @@ import joblib
 import os
 import time
 import threading
+import traceback
 from collections import deque
 from datetime import datetime
 
@@ -475,21 +476,50 @@ def speak_sign(label):
 # ─────────────────────────────────────────────────────────
 # Frame processing (core recognition pipeline)
 # ─────────────────────────────────────────────────────────
+def _is_valid_frame(frame):
+    """Check that a decoded OpenCV frame is valid for MediaPipe."""
+    if frame is None:
+        return False
+    if frame.size == 0:
+        return False
+    if frame.dtype != np.uint8:
+        return False
+    if len(frame.shape) != 3 or frame.shape[2] != 3:
+        return False
+    if frame.shape[0] < 10 or frame.shape[1] < 10:
+        return False
+    return True
+
+
 def process_camera_frame(img, state, landmarker, model, scaler, label_encoder):
     """Process a BGR camera frame through the full recognition pipeline.
 
     Runs MediaPipe hand detection, ML prediction, stability tracking,
     and frame annotation.  Returns the annotated BGR frame.
+    Returns None if the frame is invalid or processing fails.
     """
+    if not _is_valid_frame(img):
+        return None
+
     img = cv2.flip(img, 1)  # mirror effect
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Ensure contiguous uint8 array for MediaPipe
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
     # Monotonic timestamp (ms) for VIDEO mode tracking
     with state.lock:
         state.frame_ts_ms += 33
         ts = state.frame_ts_ms
-    results = landmarker.detect_for_video(mp_image, ts)
+
+    try:
+        results = landmarker.detect_for_video(mp_image, ts)
+    except Exception as e:
+        print(f"[SignSpeak] MediaPipe detect_for_video error: {e}")
+        traceback.print_exc()
+        _draw_overlay(img, "Detection error", (100, 100, 255))
+        return img
 
     hand_detected = len(results.hand_landmarks) > 0
 
@@ -903,17 +933,32 @@ def main():
 
             # Process the captured frame
             if camera_image is not None:
-                file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
-                frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    frame = process_camera_frame(
-                        frame, state, landmarker, model, scaler, label_encoder
-                    )
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    st.image(frame_rgb, use_container_width=True)
-                    st.session_state.camera_active = True
-                else:
-                    st.error("Could not decode the captured image.")
+                try:
+                    file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
+                    if file_bytes.size == 0:
+                        st.warning("Captured image is empty. Please try again.")
+                    else:
+                        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                        if not _is_valid_frame(frame):
+                            st.warning(
+                                f"Captured image could not be decoded properly "
+                                f"(shape: {frame.shape if frame is not None else 'None'}). "
+                                "Please try again."
+                            )
+                        else:
+                            frame = process_camera_frame(
+                                frame, state, landmarker, model, scaler, label_encoder
+                            )
+                            if frame is not None:
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                st.image(frame_rgb, use_container_width=True)
+                                st.session_state.camera_active = True
+                            else:
+                                st.warning("Frame processing failed. Please try again.")
+                except Exception as e:
+                    st.error(f"Error processing camera image: {e}")
+                    print(f"[SignSpeak] Live camera error: {e}")
+                    traceback.print_exc()
             else:
                 st.markdown("""
                 <div class="camera-start-placeholder">
@@ -988,48 +1033,69 @@ def main():
         )
 
         if camera_image is not None:
-            file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
-            frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-            if frame is not None:
-                frame = cv2.flip(frame, 1)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                results = landmarker.detect(mp_image)
-
-                hand_detected = len(results.hand_landmarks) > 0
-                if hand_detected:
-                    _draw_hand_skeleton(frame, results.hand_landmarks[0])
-                    hand_lms = results.hand_landmarks[0]
-                    feats = np.array(
-                        [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
-                        dtype=np.float64,
-                    ).reshape(1, -1)
-                    feats_scaled = scaler.transform(feats)
-                    probs = model.predict_proba(feats_scaled)[0]
-                    idx = int(np.argmax(probs))
-                    conf = float(probs[idx])
-                    enc_class = model.classes_[idx]
-                    label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
-
-                    if conf >= state.threshold:
-                        _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
-                        with state.lock:
-                            if not state.history or state.history[-1]["label"] != label:
-                                state.history.append({
-                                    "label": label,
-                                    "confidence": conf,
-                                    "time": datetime.now().strftime("%H:%M:%S"),
-                                })
-                    else:
-                        _draw_overlay(frame, f"Low conf: {conf:.0%}", (100, 180, 255))
+            try:
+                file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
+                if file_bytes.size == 0:
+                    st.warning("Captured image is empty. Please try again.")
                 else:
-                    _draw_overlay(frame, "No hand detected", (180, 180, 180))
+                    frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                st.image(frame_rgb)
-            else:
-                st.error("Could not decode the captured image.")
+                    if _is_valid_frame(frame):
+                        frame = cv2.flip(frame, 1)
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+                        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                        try:
+                            results = landmarker.detect(mp_image)
+                        except Exception as e:
+                            st.error(f"MediaPipe detection error: {e}")
+                            print(f"[SignSpeak] Photo capture detect error: {e}")
+                            traceback.print_exc()
+                            results = None
+
+                        if results is not None:
+                            hand_detected = len(results.hand_landmarks) > 0
+                            if hand_detected:
+                                _draw_hand_skeleton(frame, results.hand_landmarks[0])
+                                hand_lms = results.hand_landmarks[0]
+                                feats = np.array(
+                                    [c for lm in hand_lms for c in (lm.x, lm.y, lm.z)],
+                                    dtype=np.float64,
+                                ).reshape(1, -1)
+                                feats_scaled = scaler.transform(feats)
+                                probs = model.predict_proba(feats_scaled)[0]
+                                idx = int(np.argmax(probs))
+                                conf = float(probs[idx])
+                                enc_class = model.classes_[idx]
+                                label = label_encoder.inverse_transform([enc_class])[0] if label_encoder else str(enc_class)
+
+                                if conf >= state.threshold:
+                                    _draw_overlay(frame, f"{label.upper()}  {conf:.0%}", (0, 255, 100))
+                                    with state.lock:
+                                        if not state.history or state.history[-1]["label"] != label:
+                                            state.history.append({
+                                                "label": label,
+                                                "confidence": conf,
+                                                "time": datetime.now().strftime("%H:%M:%S"),
+                                            })
+                                else:
+                                    _draw_overlay(frame, f"Low conf: {conf:.0%}", (100, 180, 255))
+                            else:
+                                _draw_overlay(frame, "No hand detected", (180, 180, 180))
+
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            st.image(frame_rgb, use_container_width=True)
+                    else:
+                        st.warning(
+                            f"Captured image could not be decoded properly "
+                            f"(shape: {frame.shape if frame is not None else 'None'}). "
+                            "Please try again."
+                        )
+            except Exception as e:
+                st.error(f"Error processing photo: {e}")
+                print(f"[SignSpeak] Photo capture error: {e}")
+                traceback.print_exc()
         else:
             st.markdown("""
             <div class="camera-idle">
