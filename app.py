@@ -436,41 +436,76 @@ def _draw_stability_bar(frame, progress, y_offset=0):
                 (220, 220, 220), 1, cv2.LINE_AA)
 
 
-def _draw_hand_skeleton(frame, hand_landmarks):
-    """Draw hand skeleton overlay with visible joints and connections.
+# Import MediaPipe drawing utilities (proven, reliable skeleton overlay)
+try:
+    from mediapipe import solutions as mp_solutions
+    _HAS_DRAWING = True
+except ImportError:
+    _HAS_DRAWING = False
 
-    Drawing size scales with image resolution so the overlay stays visible
-    on high-resolution camera frames displayed at reduced width.
+
+def _draw_hand_skeleton(frame, hand_landmarks):
+    """Draw hand skeleton overlay on a BGR frame.
+
+    Primary method: MediaPipe's own drawing_utils (battle-tested, always visible).
+    Fallback: custom cv2 circles + lines with resolution-scaled sizes.
     """
-    h, w, _ = frame.shape
-    scale = max(h, w) / 640.0  # scale factor relative to 640-wide reference
-    line_w = max(2, int(3 * scale))
-    joint_r = max(4, int(5 * scale))
-    tip_r = max(5, int(7 * scale))
-    wrist_r = max(6, int(8 * scale))
-    outline = max(1, int(2 * scale))
+    if not hand_landmarks:
+        print("[SignSpeak] _draw_hand_skeleton: empty hand_landmarks, nothing to draw")
+        return
+
+    h, w = frame.shape[:2]
+    n_pts = len(hand_landmarks)
+
+    # Print first few landmark values for diagnostics
+    sample = hand_landmarks[0] if n_pts > 0 else None
+    print(
+        f"[SignSpeak] _draw_hand_skeleton: {n_pts} landmarks, "
+        f"frame={w}x{h}, first_lm=({sample.x:.3f},{sample.y:.3f})"
+    )
+
+    # ── Method 1: MediaPipe drawing_utils (preferred) ──────────
+    if _HAS_DRAWING:
+        try:
+            mp_solutions.drawing_utils.draw_landmarks(
+                frame,
+                hand_landmarks,
+                mp_solutions.hands.HAND_CONNECTIONS,
+                mp_solutions.drawing_styles.get_default_hand_landmarks_style(),
+                mp_solutions.drawing_styles.get_default_hand_connections_style(),
+            )
+            print("[SignSpeak] _draw_hand_skeleton: drew with mp.solutions.drawing_utils")
+            return
+        except Exception as e:
+            print(f"[SignSpeak] _draw_hand_skeleton: drawing_utils failed ({e}), falling back")
+
+    # ── Method 2: Custom cv2 drawing (fallback) ────────────────
+    scale = max(h, w) / 640.0
+    line_w = max(3, int(4 * scale))
+    joint_r = max(5, int(6 * scale))
+    tip_r = max(6, int(8 * scale))
+    wrist_r = max(7, int(10 * scale))
+    outline = max(2, int(2 * scale))
 
     points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
 
-    # Draw connections (scaled thickness for visibility)
     for s, e in HAND_CONNECTIONS:
-        cv2.line(frame, points[s], points[e], (0, 200, 120), line_w, cv2.LINE_AA)
+        if s < len(points) and e < len(points):
+            cv2.line(frame, points[s], points[e], (0, 255, 120), line_w, cv2.LINE_AA)
 
-    # Draw joint circles — larger for visibility
-    TIP_IDS = {4, 8, 12, 16, 20}  # fingertip landmark indices
+    TIP_IDS = {4, 8, 12, 16, 20}
     for i, p in enumerate(points):
         if i == 0:
-            # Wrist — larger, different color
-            cv2.circle(frame, p, wrist_r, (255, 100, 0), -1)
-            cv2.circle(frame, p, wrist_r, (255, 255, 255), outline)
+            cv2.circle(frame, p, wrist_r, (255, 100, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, p, wrist_r, (255, 255, 255), outline, cv2.LINE_AA)
         elif i in TIP_IDS:
-            # Fingertips — highlighted yellow
-            cv2.circle(frame, p, tip_r, (0, 255, 255), -1)
-            cv2.circle(frame, p, tip_r, (255, 255, 255), outline)
+            cv2.circle(frame, p, tip_r, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, p, tip_r, (255, 255, 255), outline, cv2.LINE_AA)
         else:
-            # Regular joints — green
-            cv2.circle(frame, p, joint_r, (0, 255, 0), -1)
-            cv2.circle(frame, p, joint_r, (255, 255, 255), outline)
+            cv2.circle(frame, p, joint_r, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, p, joint_r, (255, 255, 255), outline, cv2.LINE_AA)
+
+    print("[SignSpeak] _draw_hand_skeleton: drew with custom cv2 fallback")
 
 
 # ─────────────────────────────────────────────────────────
@@ -555,6 +590,12 @@ def process_camera_frame(img, state, landmarker, model, scaler, label_encoder):
 
     hand_detected = len(results.hand_landmarks) > 0
     n_hands = len(results.hand_landmarks)
+
+    # Log detection result
+    print(f"[SignSpeak] Live detect: n_hands={n_hands}")
+    if hand_detected:
+        for i, hl in enumerate(results.hand_landmarks):
+            print(f"[SignSpeak]   hand[{i}]: {len(hl)} landmarks")
 
     # Always draw detection debug info on the frame
     _draw_overlay(img, f"Hands detected: {n_hands}", (200, 200, 200), y=65, scale=0.6, thickness=1)
@@ -1172,6 +1213,10 @@ def main():
                             if results is not None:
                                 hand_detected = len(results.hand_landmarks) > 0
                                 n_hands = len(results.hand_landmarks)
+                                print(f"[SignSpeak] Photo detect: n_hands={n_hands}")
+                                if hand_detected:
+                                    for i, hl in enumerate(results.hand_landmarks):
+                                        print(f"[SignSpeak]   hand[{i}]: {len(hl)} landmarks")
 
                                 # Always draw detection debug info
                                 _draw_overlay(
