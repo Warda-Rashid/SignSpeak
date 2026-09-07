@@ -893,8 +893,13 @@ def render_prediction_panel(state):
         """, unsafe_allow_html=True)
 
 
-def render_history_list(state):
-    """Render recognition history with delete buttons per entry."""
+def render_history_list(state, prefix="live"):
+    """Render recognition history with delete buttons per entry.
+
+    Args:
+        state: RecognitionState instance.
+        prefix: unique string per tab to avoid duplicate Streamlit element keys.
+    """
     with state.lock:
         history = list(state.history)
 
@@ -942,7 +947,7 @@ def render_history_list(state):
                 unsafe_allow_html=True,
             )
         with col_d:
-            if st.button("Delete", key=f"del_hist_{idx}", use_container_width=True):
+            if st.button("Delete", key=f"{prefix}_del_hist_{idx}", use_container_width=True):
                 st.session_state._history_deletes.append(idx)
                 st.rerun()
 
@@ -1393,7 +1398,7 @@ def main():
             render_stat_cards(history_snapshot)
 
             st.markdown("#### Recognition History")
-            render_history_list(state)
+            render_history_list(state, prefix="photo")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
